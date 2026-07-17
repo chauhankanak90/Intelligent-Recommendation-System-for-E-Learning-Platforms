@@ -189,11 +189,10 @@ This app is deployed on **Streamlit Community Cloud**:
 
 ## 👤 Author
 
-**[kanak chauhan]**
-[B.tech Cse(AI/ML)] 
+* **Kanak Chauhan**
+* **B.Tech CSE (AI/ML)**
 
-📧 [your.email@example.com](chauhankanak822@gmail.com) · 🔗 [LinkedIn](www.linkedin.com/in/kanak-chauhan-7ba173366) · 💻 [GitHub](https://github.com/chauhankanak90)
-
+📧 [chauhankanak822@gmail.com](mailto:chauhankanak822@gmail.com) · 🔗 [LinkedIn](https://www.linkedin.com/in/kanak-chauhan-7ba173366) · 💻 [GitHub](https://github.com/chauhankanak90)
 ---
 
 <div align="center">
