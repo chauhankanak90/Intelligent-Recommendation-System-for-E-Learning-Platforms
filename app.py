@@ -610,7 +610,8 @@ elif selected_menu == "AI Doubts Chatbot":
     with btn_col1:
         if st.button("Clear chat history", use_container_width=True):
             st.session_state.chat_messages = []
-            st.rerun()
+            # for testing
+            #st.rerun()
     with btn_col2:
         if st.session_state.chat_messages:
             chat_md = "\n\n".join(
