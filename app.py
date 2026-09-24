@@ -622,10 +622,11 @@ elif selected_menu == "AI Doubts Chatbot":
                 "Download chat", data=chat_md, file_name="ai_mentor_chat.md",
                 mime="text/markdown", use_container_width=True,
             )
+            # Testing pull request webhook
 
-    st.write("---")
+    #st.write("---")
 
-    for message in st.session_state.chat_messages:
+    #for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
