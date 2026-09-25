@@ -628,7 +628,7 @@ elif selected_menu == "AI Doubts Chatbot":
 
     #for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            # st.markdown(message["content"])
 
     if user_query := st.chat_input("Ask a doubt (e.g., Explain standard deviation in plain English)"):
         with st.chat_message("user"):
