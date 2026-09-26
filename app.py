@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import json
 
-import gemini
-import recommendation as rec
-import database as db
-import pdf_export
-from streamlit_option_menu import option_menu
+# import gemini
+# import recommendation as rec
+# import database as db
+# import pdf_export
+# from streamlit_option_menu import option_menu
 
 # ----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION
