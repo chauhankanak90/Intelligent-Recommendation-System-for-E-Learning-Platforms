@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import json
 
-import gemini
-import recommendation as rec
-import database as db
-import pdf_export
-from streamlit_option_menu import option_menu
+# import gemini
+# import recommendation as rec
+# import database as db
+# import pdf_export
+# from streamlit_option_menu import option_menu
 
 # ----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION
@@ -610,7 +610,8 @@ elif selected_menu == "AI Doubts Chatbot":
     with btn_col1:
         if st.button("Clear chat history", use_container_width=True):
             st.session_state.chat_messages = []
-            st.rerun()
+            # for testing
+            #st.rerun()
     with btn_col2:
         if st.session_state.chat_messages:
             chat_md = "\n\n".join(
@@ -621,10 +622,11 @@ elif selected_menu == "AI Doubts Chatbot":
                 "Download chat", data=chat_md, file_name="ai_mentor_chat.md",
                 mime="text/markdown", use_container_width=True,
             )
+            # Testing pull request webhook
 
-    st.write("---")
+    #st.write("---")
 
-    for message in st.session_state.chat_messages:
+    #for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
