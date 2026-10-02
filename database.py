@@ -205,6 +205,21 @@ def get_student_data(name):
     return dict(data) if data else None
 
 
+def get_recent_profiles(limit=5):
+    """Recent student profiles fetch karne ke liye."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT s.*, r.analysis_json, r.roadmap_json, r.updated_at
+    FROM students s
+    LEFT JOIN roadmaps r ON s.id = r.student_id
+    ORDER BY s.id DESC LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 if __name__ == "__main__":
     init_db()
     print("Database Tables Successfully Created!")
