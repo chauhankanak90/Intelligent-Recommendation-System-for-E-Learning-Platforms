@@ -23,21 +23,29 @@ warnings.filterwarnings("ignore", message=".*non-text parts in the response.*")
 # 2. Supported and Fallback Models
 # Reliable primary model with fallback cascade for high-demand (503) scenarios
 load_dotenv()
-# You can override the main model without editing code: add GEMINI_MODEL=gemini-3.5-flash-lite to .env
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.6-flash"
-logging.warning("gemini.py v7 loaded | primary model = %s", PRIMARY_MODEL)
+# You can override the main model without editing code: add GEMINI_MODEL=gemini-flash-lite-latest to .env
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-flash-lite-latest"
+logging.warning("gemini.py v8 loaded | primary model = %s", PRIMARY_MODEL)
 
 FALLBACK_MODELS = [
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
 ]  # PRIMARY_MODEL is always tried first; duplicates are removed automatically
 
 # Shared state (lives for the whole Streamlit server process, so every user/request benefits)
 _STATE_LOCK = threading.Lock()
 _COOLDOWN_UNTIL = {}                      # model -> timestamp until which it is skipped after a 503
-_NO_THINKING = {"gemini-3.5-flash-lite"}  # models that reject thinking_config (learned automatically too)
+_NO_THINKING = {
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+}  # models that reject thinking_config (learned automatically too)
 COOLDOWN_SECONDS = 60
 
 
@@ -89,7 +97,7 @@ def _get_client():
         # Timeout (seconds) so a busy/hanging model cannot block the app for a long time.
         # Change it with GEMINI_TIMEOUT_SEC in .env if needed.
         try:
-            timeout_ms = int(float(os.getenv("GEMINI_TIMEOUT_SEC", "40")) * 1000)
+            timeout_ms = int(float(os.getenv("GEMINI_TIMEOUT_SEC", "15")) * 1000)
             return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_ms))
         except Exception:
             return genai.Client(api_key=key)
@@ -109,8 +117,8 @@ def classify_error(err: Exception) -> tuple[str, str]:
     if any(k in err_str for k in ["api_key_invalid", "api key not valid", "unauthenticated", "invalid api key", "permission_denied", "forbidden"]) or getattr(err, "code", None) in [401, 403]:
         return "AUTH_ERROR", "Gemini API authentication failed. Please check your local API configuration."
     
-    # Check for high demand / temporary service unavailable (503)
-    if "503" in err_str or "unavailable" in err_str or "high demand" in err_str or "overloaded" in err_str or getattr(err, "code", None) == 503 or isinstance(err, errors.ServerError):
+    # Check for high demand / temporary service unavailable (503 / 504 / deadline)
+    if any(k in err_str for k in ["503", "504", "unavailable", "high demand", "overloaded", "deadline"]) or getattr(err, "code", None) in [503, 504] or isinstance(err, errors.ServerError):
         return "SERVICE_UNAVAILABLE", "AI service is temporarily busy. We've switched to a fallback mode. Please try again shortly."
     
     # Check for quota / rate-limiting (429)
@@ -217,7 +225,7 @@ def _call_model(prompt: str, retries: int = 1, temperature: float = 0.7, json_mo
     last_error = None
     start_time = time.time()
     # Stop trying new models after this many seconds so the app answers (offline) instead of hanging
-    max_wait = float(os.getenv("GEMINI_MAX_WAIT_SEC", "25"))
+    max_wait = float(os.getenv("GEMINI_MAX_WAIT_SEC", "35"))
 
     for round_no in range(2):
         saw_overload = False
@@ -225,7 +233,7 @@ def _call_model(prompt: str, retries: int = 1, temperature: float = 0.7, json_mo
         for model_name in _model_order():
             if last_error is not None and (time.time() - start_time) > max_wait:
                 break
-            use_thinking = model_name not in _NO_THINKING
+            use_thinking = ("lite" not in model_name.lower()) and (model_name not in _NO_THINKING)
             attempt = 0
             while attempt <= retries:
                 try:
