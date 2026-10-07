@@ -5,7 +5,9 @@ import json
 import time
 import logging
 import warnings
+import threading
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 from google import genai
 from google.genai import types
 from google.genai import errors
@@ -20,13 +22,42 @@ warnings.filterwarnings("ignore", message=".*non-text parts in the response.*")
 
 # 2. Supported and Fallback Models
 # Reliable primary model with fallback cascade for high-demand (503) scenarios
-# 2. Supported and Fallback Models
-PRIMARY_MODEL = "gemini-3.6-flash"
+load_dotenv()
+# You can override the main model without editing code: add GEMINI_MODEL=gemini-3.5-flash-lite to .env
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.6-flash"
+logging.warning("gemini.py v7 loaded | primary model = %s", PRIMARY_MODEL)
 
 FALLBACK_MODELS = [
-    "gemini-3.7-flash",
-    "gemini-3.8-flash",
-]
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]  # PRIMARY_MODEL is always tried first; duplicates are removed automatically
+
+# Shared state (lives for the whole Streamlit server process, so every user/request benefits)
+_STATE_LOCK = threading.Lock()
+_COOLDOWN_UNTIL = {}                      # model -> timestamp until which it is skipped after a 503
+_NO_THINKING = {"gemini-3.5-flash-lite"}  # models that reject thinking_config (learned automatically too)
+COOLDOWN_SECONDS = 60
+
+
+def _model_order() -> list:
+    """Models to try, skipping ones that recently returned 503. If all are cooling down, try all."""
+    now = time.time()
+    cascade = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_MODEL]
+    with _STATE_LOCK:
+        available = [m for m in cascade if _COOLDOWN_UNTIL.get(m, 0) <= now]
+    return available or cascade
+
+
+def _mark_overloaded(model_name: str) -> None:
+    with _STATE_LOCK:
+        _COOLDOWN_UNTIL[model_name] = time.time() + COOLDOWN_SECONDS
+
+
+def _mark_no_thinking(model_name: str) -> None:
+    with _STATE_LOCK:
+        _NO_THINKING.add(model_name)
 
 def _get_api_key():
     """Retrieves API key from environment (.env / OS) or Streamlit secrets without exposing it."""
@@ -55,7 +86,13 @@ def _get_client():
     if not key:
         return None
     try:
-        return genai.Client(api_key=key)
+        # Timeout (seconds) so a busy/hanging model cannot block the app for a long time.
+        # Change it with GEMINI_TIMEOUT_SEC in .env if needed.
+        try:
+            timeout_ms = int(float(os.getenv("GEMINI_TIMEOUT_SEC", "40")) * 1000)
+            return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_ms))
+        except Exception:
+            return genai.Client(api_key=key)
     except Exception as e:
         logging.error(f"Failed to initialize GenAI client: {e}")
         return None
@@ -143,55 +180,105 @@ def _extract_json(raw_text: str) -> dict:
         return json.loads(cleaned)
 
 
-def _call_model(prompt: str, retries: int = 2, temperature: float = 0.7, json_mode: bool = True) -> str:
-    """Calls Gemini API with automatic model fallback and exponential backoff retry.
-    Retries transient 503 / 429 errors up to 2 times per model before cascading to fallbacks.
+def _fit_roadmap_to_weeks(roadmap: list, total_weeks: int) -> list:
+    """Guarantees the roadmap never runs past the requested number of weeks.
+    Drops entries that start after total_weeks and clips ranges like 'Week 9-14' to 'Week 9-10'.
+    Entries without parseable numbers are kept as-is."""
+    fitted = []
+    for item in roadmap:
+        label = str(item.get("Week", ""))
+        nums = [int(n) for n in re.findall(r"\d+", label)]
+        if not nums:
+            fitted.append(item)
+            continue
+        start, end = nums[0], nums[-1]
+        if start > total_weeks:
+            continue
+        if end > total_weeks:
+            item = dict(item)
+            item["Week"] = f"Week {start}" if start == total_weeks else f"Week {start}-{total_weeks}"
+        fitted.append(item)
+    return fitted if fitted else roadmap[:1]
+
+
+def _call_model(prompt: str, retries: int = 1, temperature: float = 0.7, json_mode: bool = True) -> str:
+    """Calls Gemini with fast failover.
+    - 503 (overloaded): the model is put on a 60s cooldown and the NEXT model is tried immediately
+      (no pointless waiting on a model that is busy).
+    - 400 (invalid argument): same model is retried once without thinking_config, and remembered.
+    - 429 (quota): short wait, retry, then next model.
+    - If every model was overloaded, the whole list is tried once more after a 3s pause.
+    The real error is always logged to the terminal.
     """
     client = _get_client()
     if not client:
         raise ValueError("Gemini API authentication failed. Please check your local API configuration.")
 
-    model_cascade = [PRIMARY_MODEL] + FALLBACK_MODELS
     last_error = None
+    start_time = time.time()
+    # Stop trying new models after this many seconds so the app answers (offline) instead of hanging
+    max_wait = float(os.getenv("GEMINI_MAX_WAIT_SEC", "25"))
 
-    for model_name in model_cascade:
-        for attempt in range(retries + 1):
-            try:
-                config_kwargs = {
-                    "temperature": temperature,
-                    "thinking_config": types.ThinkingConfig(thinking_budget=0),
-                }
-                if json_mode:
-                    config_kwargs["response_mime_type"] = "application/json"
+    for round_no in range(2):
+        saw_overload = False
 
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(**config_kwargs),
-                )
+        for model_name in _model_order():
+            if last_error is not None and (time.time() - start_time) > max_wait:
+                break
+            use_thinking = model_name not in _NO_THINKING
+            attempt = 0
+            while attempt <= retries:
+                try:
+                    config_kwargs = {"temperature": temperature}
+                    if use_thinking:
+                        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                    if json_mode:
+                        config_kwargs["response_mime_type"] = "application/json"
 
-                extracted_text = _clean_response_text(response)
-                if not extracted_text:
-                    raise ValueError(f"Received empty response from {model_name}.")
-                return extracted_text
+                    _t0 = time.time()
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    )
 
-            except Exception as e:
-                last_error = e
-                category, _ = classify_error(e)
+                    extracted_text = _clean_response_text(response)
+                    if not extracted_text:
+                        raise ValueError(f"Received empty response from {model_name}.")
+                    logging.warning("GEMINI OK | model=%s | %.1fs | %d chars", model_name, time.time() - _t0, len(extracted_text))
+                    return extracted_text
 
-                # Do not retry on authentication / bad request errors
-                if category == "AUTH_ERROR":
-                    raise e
+                except Exception as e:
+                    last_error = e
+                    logging.error("GEMINI FAIL | model=%s | round=%s | attempt=%s | after %.1fs | %r", model_name, round_no, attempt, time.time() - _t0 if '_t0' in locals() else 0.0, e)
+                    category, _ = classify_error(e)
 
-                # On transient 503/429, back off exponentially with capped sleep
-                if attempt < retries and category in ["SERVICE_UNAVAILABLE", "QUOTA_EXCEEDED"]:
-                    backoff = min(1.2 * (2 ** attempt), 3.5)
-                    time.sleep(backoff)
-                else:
-                    # Model exhausted its retries, break inner loop to try next fallback model
-                    break
+                    if category == "AUTH_ERROR":
+                        raise e
 
-    # If all models in the cascade failed
+                    # 400: usually an unsupported thinking config -> retry without it and remember
+                    if use_thinking and (getattr(e, "code", None) == 400 or "thinking" in str(e).lower()):
+                        use_thinking = False
+                        _mark_no_thinking(model_name)
+                        continue
+
+                    if category == "SERVICE_UNAVAILABLE":
+                        saw_overload = True
+                        _mark_overloaded(model_name)
+                        break  # go to next model right away
+
+                    if category == "QUOTA_EXCEEDED" and attempt < retries:
+                        time.sleep(2.0)
+                        attempt += 1
+                        continue
+
+                    break  # any other error: next model
+
+        if saw_overload and round_no == 0 and (time.time() - start_time) <= max_wait:
+            time.sleep(3)
+            continue
+        break
+
     raise last_error if last_error else RuntimeError("AI service failed across all available models.")
 
 
@@ -210,6 +297,17 @@ def generate_career_roadmap(
     Merges specialized prompts and normalizes response structure.
     Falls back gracefully to offline mode if the AI service is unavailable.
     """
+    # Accept common alternate names for the duration, in case app.py uses one of them
+    for _alias in ("weeks", "duration_weeks", "duration", "num_weeks", "timeline"):
+        if kwargs.get(_alias):
+            timeline_weeks = kwargs[_alias]
+            break
+    try:
+        timeline_weeks = int(re.findall(r"\d+", str(timeline_weeks))[0])
+    except Exception:
+        timeline_weeks = 12
+    timeline_weeks = max(1, timeline_weeks)
+
     try:
         analysis_prompt = prompts.PROFILE_ANALYSIS_PROMPT.format(
             name=user_name, year=year, branch=branch, skills=current_skills,
@@ -217,10 +315,20 @@ def generate_career_roadmap(
         )
         roadmap_prompt = prompts.ROADMAP_PROMPT.format(
             goal=target_role, skills=current_skills, study_time=study_time,
+        ) + (
+            f"\n\nIMPORTANT CONSTRAINT: The roadmap must cover EXACTLY {timeline_weeks} weeks in total. "
+            f"Plan the weeks so the last entry ends at Week {timeline_weeks}. "
+            f"Never include any week beyond Week {timeline_weeks}."
         )
 
-        analysis_json = _extract_json(_call_model(analysis_prompt, temperature=0.4, json_mode=True))
-        roadmap_json = _extract_json(_call_model(roadmap_prompt, temperature=0.6, json_mode=True))
+        # Both AI calls run at the same time (about 2x faster than one after the other)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_analysis = pool.submit(_call_model, analysis_prompt, 1, 0.4, True)
+            f_roadmap = pool.submit(_call_model, roadmap_prompt, 1, 0.6, True)
+            analysis_text = f_analysis.result()
+            roadmap_text = f_roadmap.result()
+        analysis_json = _extract_json(analysis_text)
+        roadmap_json = _extract_json(roadmap_text)
 
         missing = analysis_json.get("missing_skills", [])
         if not isinstance(missing, list):
@@ -249,6 +357,11 @@ def generate_career_roadmap(
                 "Project": project,
             })
 
+        # Safety net: never exceed the requested number of weeks
+        if not normalized_roadmap:
+            raise ValueError("AI returned an empty roadmap.")
+        normalized_roadmap = _fit_roadmap_to_weeks(normalized_roadmap, timeline_weeks)
+
         combined = {
             "profile_analysis": {
                 "readiness_score": int(analysis_json.get("readiness_score", fallback_score)),
@@ -263,6 +376,7 @@ def generate_career_roadmap(
         return json.dumps(combined)
 
     except Exception as e:
+        logging.error("ROADMAP FALLBACK TRIGGERED | %r", e)
         category, friendly_message = classify_error(e)
         return json.dumps(_fallback_roadmap(
             target_role, current_skills, timeline_weeks, level, study_time,
@@ -400,7 +514,10 @@ def _fallback_roadmap(
             },
         ]
 
-    allowed_chunks = max(1, timeline_weeks // 4)
+    try:
+        timeline_weeks = max(1, int(timeline_weeks))
+    except Exception:
+        timeline_weeks = 12
     return {
         "profile_analysis": {
             "readiness_score": score,
@@ -410,7 +527,7 @@ def _fallback_roadmap(
             "career_advice": error_message,
             "error_category": error_category,
         },
-        "roadmap": full_roadmap[:allowed_chunks],
+        "roadmap": _fit_roadmap_to_weeks(full_roadmap, timeline_weeks),
         "source": "fallback",
         "error_category": error_category,
         "error_message": error_message,
@@ -426,6 +543,7 @@ def get_quiz_questions(topic: str, level: str) -> dict:
             raise ValueError("Received an empty quiz array.")
         return data
     except Exception as e:
+        logging.error("QUIZ FAIL | %r", e)
         category, friendly_message = classify_error(e)
         return {"error": friendly_message, "category": category}
 
@@ -445,37 +563,12 @@ def get_chatbot_reply(user_query: str, chat_history: list) -> str:
         )
         full_prompt = f"{system_instruction}\n\n{history_text}User: {user_query}\nMentor:"
 
-        client = _get_client()
-        if not client:
+        if not is_configured():
             return "Gemini API authentication failed. Please check your local API configuration."
 
-        # Model cascade for chatbot
-        model_cascade = [PRIMARY_MODEL] + FALLBACK_MODELS
-        last_error = None
-
-        for model_name in model_cascade:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.7,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                text = _clean_response_text(response)
-                if text:
-                    return text
-            except Exception as e:
-                last_error = e
-                category, _ = classify_error(e)
-                if category == "AUTH_ERROR":
-                    return "Gemini API authentication failed. Please check your local API configuration."
-                continue
-
-        category, friendly_msg = classify_error(last_error) if last_error else ("GENERAL_ERROR", "AI service is currently unavailable.")
-        return f"{friendly_msg}"
+        return _call_model(full_prompt, retries=1, temperature=0.7, json_mode=False)
 
     except Exception as e:
+        logging.error("CHATBOT FAIL | %r", e)
         _, friendly_msg = classify_error(e)
         return friendly_msg
